@@ -1,0 +1,297 @@
+import tlfilters
+
+#Number of hits required within a cell to calculate a correction. Recommend 5 or higher.
+min_cell_hits = 3
+
+#Turns zscore filter on or off (filtering based on twistgrip)
+#Note that this is NOT optimized for J1850 or 2021+ bikes yet. 
+use_z_score_filter = False
+
+#Recommend 0.75 - this is how different the VE value from the ECU can be from the VE value in the table.
+#This generally filters out transients really well and ensures we're only calculating corrections on the VE table.
+#When no other conditions are present. You can increase this value to make the calculation more "tolerant" but also more error prone.
+ve_delta_thresh = 10000
+
+#This number controls how aggressive corrections are.
+#A value of 1.05 = 105% (Meaning corrections will be increased in aggressiveness by 5%.)
+error_multiplier = 1.00
+
+#rc filter constant
+#This is used to set the smoothing level for WB AFR data.
+#Higher numbers mean more smoothing. Default is 200.
+#WB2 should use a smoothing value of 100-200.
+#DWRT WB should use a value of 500. (May need some adjustment based on your specific setup and the amount of sensor noise.)
+smoothing = 100
+
+#Default reads minimum MAP from the tune. If MAP is less than this, blank out corrections. (This accounts for throttle transients.)  
+#Change next line to False to use a specific value. (Default value = 10 kpa.)
+use_CL_min_map = True
+specific_value = 10
+map_min_table = "Closed Loop MAP Enable"
+map_min = channels.Convert(specific_value, "kPa")
+map_max = channels.Convert(100, "kPa")
+if use_CL_min_map:
+    try:
+        CLMinMap = context.GetTable(map_min_table)
+        CLMinMapValue = CLMinMap.LookupCell(0, 0)
+        map_min = channels.Convert(CLMinMapValue, "kPa")
+    except ValueError:
+        map_min = channels.Convert(specific_value, "kPa") 
+show_plot = True
+badval = float("nan")
+lambdaRangeTable = None
+try:
+	#Get the closed loop min / max from the calibration itself
+	lambdaRangeTable = context.GetTable("Closed Loop Lambda Range")
+except ValueError:
+	print "Failed to find lambda range table; defaulting to AFR cal"
+if lambdaRangeTable:
+	#filter out samples when requested afr is less than this value
+	closed_loop_min = lambdaRangeTable.GetZValue(1, 0)
+	#filter out samples when requested afr is greater than this value
+	closed_loop_max = lambdaRangeTable.GetZValue(0, 0);
+else:
+	closed_loop_max =  channels.Convert(14.7001, "AFR")
+	closed_loop_min = channels.Convert(14.59, "AFR")
+print "Using Closed Loop Min: %f" % closed_loop_min
+print "Using Closed Loop Max: %f" % closed_loop_max
+engine_temp_min = channels.Convert(180, "F")
+engine_temp_max = channels.Convert(275, "F")
+max_wb_afr = channels.Convert(19.0, "AFR")
+min_wb_afr = channels.Convert(10.0, "AFR")
+tp_min = 5
+tp_max = 100
+cylinder_front = "Front"
+cylinder_rear = "Rear"
+cylinder = cylinder_front
+
+#the table to base corrections on, but not necessarily the one we'll update. 
+ve_front = "VE (TPS based/Front Cyl)"
+ve_rear = "VE (TPS based/Rear Cyl)"
+ve_multiplier_front = "VVT Multiplier (Front Cyl)"
+ve_multiplier_rear = "VVT Multiplier (Rear Cyl)"
+
+#Check for "VVT Cam" to see if VE Multiplier tables are used.
+useVVT = False
+useVeMultTable = None
+try:
+	useVeMultTable = context.GetTable("VVT Cam Switch")
+	useVeMultTableVal = useVeMultTable.LookupCell(0, 0)
+	if useVeMultTableVal == 1:
+		useVVT = True
+except ValueError:
+	useVeMultTable = None
+#The vvt_multiplier_bias value controls how much to change VVT Multiplier tables vs traditional VE tables. 
+#vvt_multiplier_bias = 1 #Apply all changes to VVT Multiplier tables.
+#vvt_multiplier_bias = 0 #Apply all changes to traditional VE tables.
+vvt_multiplier_bias = 0.9 #Apply 90% of changes to VVT Multiplier tables and 10% to traditional VE tables.
+
+#Uncomment this line if you select the wrong AFR channel. (Closing and re-opening the document will also handle this)
+#context.ClearAFRSelection()
+
+def get_correction_table():
+	if cylinder == cylinder_front:
+		return context.GetTable(ve_front)
+	else:
+		return context.GetTable(ve_rear)
+def get_requested_afr_channel(fileHandle):
+	requested = None
+	try:
+		requested = channels.GetChannelByName("Desired Air/Fuel", fileHandle)
+	except ValueError:
+		print "Unable to find Desired Air/Fuel channel, assuming lambda channel"
+		requested = channels.GetChannelByName("Desired Lambda", fileHandle)
+	#when converting from PVOG channels, on some platforms the a/f channel will be populated with zero and we
+	#have to use the lambda channel instead.
+	allZero = True
+	for requestedSample in requested.GetAllSamples():
+		if requestedSample.Value != 0:
+			allZero = False
+			break
+	if allZero:
+		requested = channels.GetChannelByName("Desired Lambda", fileHandle)
+	return requested
+def isNaN(num):
+	return num != num
+#Callback passed to generate_sample_table that creates the corrected VE channel 
+def calc_error_channel(fileHandle):
+
+	requested = get_requested_afr_channel(fileHandle)
+
+	tgChan = None
+	try:
+		tgChan = channels.GetChannelByName("Twistgrip Position", fileHandle, False)
+	except ValueError:
+		print "Unable to find TG position channel, defaulting to TPS chan."
+
+	tpsChan = channels.GetChannelByName("Throttle Position", fileHandle)
+
+	if tgChan:
+		zScore = tgChan.CalcZScore(80, 2.5, 0.05)
+	elif tpsChan:
+		zScore = tpsChan.CalcZScore(80, 2.5, 0.05)
+
+	#turn on to show where samples are being filtered out due to zscore.
+	#context.Plot(zScore.GetAllSamples())
+
+	ve_actual = channels.GetChannelByName("VE %s" % cylinder, fileHandle)
+	map = channels.GetChannelByName("Manifold Absolute Pressure", fileHandle)
+
+	if cylinder == "Front":
+		if tl_afr1_chan == "":
+			afr = context.AFR1(fileHandle)
+		else:
+			afr = channels.GetChannelByName(tl_afr1_chan, fileHandle)
+	elif cylinder == "Rear":
+		if tl_afr2_chan == "":
+			afr = context.AFR2(fileHandle)
+		else:
+			afr = channels.GetChannelByName(tl_afr2_chan, fileHandle)
+	else:
+		raise Exception("Invalid cylinder selected!")
+	
+	if afr is not None:
+		#rc = tlfilters.LowpassFilter(rc=smoothing)
+		#rc.do_filter(None, None, afr.GetAllSamples())
+		minMaxFilter = tlfilters.BasicMinMaxZFilter(min=tl_min_wb_afr, max=tl_max_wb_afr)
+		minMaxFilter.do_filter(None, None, afr.GetAllSamples())
+		afr.Smooth(smoothing)
+	
+	engine_temp = channels.GetChannelByName("Engine Temperature", fileHandle)
+	correctionTable = get_correction_table()
+	xChan = correctionTable.GetXChannel(fileHandle)
+	yChan = correctionTable.GetYChannel(fileHandle)
+	
+	sampleCount = 0
+	mapThreshCount = 0
+	zScoreCount = 0
+	inClosedLoopButNotCount = 0
+	tempThreshCount = 0
+	noAfrCount = 0
+	veOutOfRangeCount = 0
+	tpThresholdCount = 0
+	noRequestedAfrCount = 0
+	wrongBiasCount = 0
+	
+	for sample in afr.GetAllSamples():
+		sampleCount += 1
+		context.IncrementCount()
+				
+		xVal = xChan.GetValueAtTime(sample.TimeMillis, wideLookup = True)
+		yVal = yChan.GetValueAtTime(sample.TimeMillis, wideLookup = True)
+		veVal = correctionTable.Lookup(xVal, yVal)
+		veActualValue = ve_actual.GetValueAtTime(sample.TimeMillis, wideLookup = True)
+		mapVal = map.GetValueAtTime(sample.TimeMillis, wideLookup = True)			
+		tpsVal = tpsChan.GetValueAtTime(sample.TimeMillis, wideLookup = True)						
+		requested_value = requested.GetValueAtTime(sample.TimeMillis, wideLookup = True)
+		engineTempValue = engine_temp.GetValueAtTime(sample.TimeMillis, wideLookup = True)
+		errorTotal = 0;
+		errorCount = 0;
+					
+		#if abs(veVal - veActualValue) > ve_delta_thresh:
+		#	sample.Value = badval
+		#	veOutOfRangeCount += 1
+		#	context.Reject("VE out of range. Cylinder - " + cylinder, sample)
+		if engineTempValue <= engine_temp_min or engineTempValue >= engine_temp_max: 
+			sample.Value = badval
+			tempThreshCount += 1
+			context.Reject("Temp out of range. Cylinder - " + cylinder, sample)
+		elif mapVal < map_min or mapVal > map_max: #manifold pressure threshold
+			sample.Value = badval
+			mapThreshCount += 1
+			context.Reject("MAP out of range. Cylinder - " + cylinder, sample)
+		elif tpsVal < tp_min or tpsVal > tp_max: 
+			sample.Value = badval
+			tpThresholdCount += 1
+			context.Reject("TPS out of range. Cylinder - " + cylinder, sample)
+		elif use_z_score_filter and (zScore.GetValueAtTime(sample.TimeMillis) != 0 or zScore.GetValueAtTime(sample.TimeMillis + 100) != 0):
+			sample.Value = badval
+			zScoreCount += 1
+			context.Reject("TPS in transition. Cylinder - " + cylinder, sample)
+		elif isNaN(requested_value):
+			sample.Value = badval
+			noRequestedAfrCount += 1
+			context.Reject("No requested AFR at time. Cylinder - " + cylinder, sample)
+		elif afr is not None:
+			afrVal = afr.GetValueAtTime(sample.TimeMillis)
+			errorPercent = (afrVal / requested_value)
+			errorTotal = errorTotal + errorPercent
+			errorCount += 1
+
+			errorVal = (errorPercent-1.0) * 100.0 * tl_error_multiplier
+			
+			if errorVal > tl_max_adjustment:
+				errorVal = tl_max_adjustment
+			elif errorVal < -tl_max_adjustment:
+				errorVal = -tl_max_adjustment
+
+			sample.Value = (errorVal/100.0) + 1.0
+			context.Accept(sample)
+		else: 
+			sample.Value = badval	
+			noAfrCount += 1
+			context.Reject("No AFR Sample. Cylinder - " + cylinder, sample)
+		#print errorTotal
+		#print errorCount
+        #print veOutOfRangeCount
+        #print tempThreshCount
+        #print mapThreshCount
+        #print tpThresholdCount
+        #print zScoreCount
+        #print noRequestedAfrCount
+        #print noAfrCount
+	return afr
+	
+#ensure that we've got logfiles loaded in Data Center...
+if context.EnsureFiles():
+	try:
+		cylinder = cylinder_front #front cylinder first
+		#### TABLE 1 ######
+		#Create a table the same dimensions as VE and fill it with corrected VE data.
+        #Start by correcting the VVT Multiplier table if applicable.
+        if(useVVT):
+            error = tunelab.generate_sample_table(context.GetTable(ve_multiplier_front), calc_error_channel, hitThres=(min_cell_hits / 2))            
+            if error != None:
+                #Allow the user to edit/review the corrected VE values.
+                error = edit(error * 100.0 - 100.0)
+                if error != None: #Put the corrected cells into the VE Mult table.
+                    error = error * vvt_multiplier_bias
+                    error = (error+100.0)/100.0
+                    context.PutTable(error * context.GetTable(ve_multiplier_front))
+        #Correct the traditional VE table.
+        error = tunelab.generate_sample_table(context.GetTable(ve_front), calc_error_channel, hitThres=(min_cell_hits / 2))
+        if error != None:
+            error = edit(error * 100.0 - 100.0)
+            if error != None:
+                if(useVVT):
+                    error = error * (1 - vvt_multiplier_bias)
+                error = (error+100.0)/100.0
+                #Put the corrected cells into the VE table.
+                context.PutTable(error * context.GetTable(ve_front))				
+        ###### TABLE 2 #######
+		#Create a table the same dimensions as the VE table and fill it with corrected VE channel data.
+        #Start by correcting the VVT Multiplier table if applicable.
+		cylinder = cylinder_rear #Switch to rear cylinder before rerunning correction.
+        if(useVVT):
+            error = tunelab.generate_sample_table(context.GetTable(ve_multiplier_rear), calc_error_channel, hitThres=(min_cell_hits / 2))
+            if error != None:
+                #Allow the user to edit/review the corrected VE values.
+                error = edit(error * 100.0 - 100.0)
+                if error != None: #Put the corrected cells into the VE Mult table.
+                    error = error * vvt_multiplier_bias
+                    error = (error+100.0)/100.0
+                    context.PutTable(error * context.GetTable(ve_multiplier_rear))
+        #Correct the traditional VE table.
+        error = tunelab.generate_sample_table(context.GetTable(ve_rear), calc_error_channel, hitThres=(min_cell_hits / 2))
+        if error != None:
+            error = edit(error * 100.0 - 100.0)
+            if error != None:
+                if(useVVT):
+                    error = error * (1 - vvt_multiplier_bias)
+                error = (error+100.0)/100.0
+                #Put the corrected cells into the VE tables, beginning with TPS-based.
+                context.PutTable(error * context.GetTable(ve_rear))	
+				
+	finally:
+		#always clean up any files that we might have opened at the start
+		context.FreeFiles()
